@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+    <meta charset="utf-8">
+    <title>MotoNav Pro Dashboard</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+    <script src='https://api.mapbox.com/mapbox-gl-js/v2.15.0/mapbox-gl.js'></script>
+    <link href='https://api.mapbox.com/mapbox-gl-js/v2.15.0/mapbox-gl.css' rel='stylesheet' />
+    <style>
+        body { margin: 0; padding: 0; background: #000; color: #fff; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; overflow: hidden; }
+        #map { height: 65vh; width: 100%; border-bottom: 2px solid #333; }
+        .ui-panel { height: 35vh; padding: 15px; display: flex; flex-direction: column; align-items: center; justify-content: flex-start; gap: 10px; box-sizing: border-box; background: #111; }
+        #status { font-size: 14px; font-weight: bold; color: #ff4444; }
+        .btn { background: #007bff; color: white; border: none; padding: 15px 0; border-radius: 12px; font-size: 18px; width: 90%; font-weight: bold; cursor: pointer; transition: 0.3s; }
+        .btn:active { background: #0056b3; transform: scale(0.98); }
+        #info-box { width: 90%; padding: 10px; background: #222; border-radius: 8px; border: 1px solid #444; text-align: center; }
+        #instruction { font-size: 18px; color: #00ff00; margin-bottom: 5px; font-weight: bold; }
+        #stats { font-size: 14px; color: #aaa; }
+        /* Haritadaki "Konumuma Dön" butonu tasarımı */
+        .recenter-btn { position: absolute; top: 10px; right: 10px; background: white; color: black; border: none; padding: 10px; border-radius: 50%; width: 40px; height: 40px; font-weight: bold; box-shadow: 0 2px 5px rgba(0,0,0,0.5); z-index: 10; }
+    </style>
+</head>
+<body>
+
+    <div id="map">
+        <button class="recenter-btn" onclick="recenterMap()">◎</button>
+    </div>
+
+    <div class="ui-panel">
+        <div id="status">Bluetooth: Bağlı Değil</div>
+        <button class="btn" onclick="initBLE()">ESP32'YE BAĞLAN</button>
+        
+        <div id="info-box">
+            <div id="instruction">Hedef Seçin</div>
+            <div id="stats">Hız: 0 km/h | Kalan: --</div>
+        </div>
+    </div>
+
+<script>
+    // --- KONFİGÜRASYON ---
+    const MAPBOX_TOKEN = 'MAPBOX_TOKEN_BURAYA'; // Kendi tokenınızı buraya yapıştırın
+    mapboxgl.accessToken = MAPBOX_TOKEN;
+
+    const SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
+    const CHAR_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
+
+    let bleCharacteristic, userLocation, currentDestination, isNavigating = false;
+    let isMapInteracting = false; // Harita zıplamasını önlemek için kontrol değişkeni
+
+    // --- HARİTA BAŞLATMA ---
+    const map = new mapboxgl.Map({
+        container: 'map',
+        style: 'mapbox://styles/mapbox/navigation-night-v1',
+        center: [28.9795, 41.0082], 
+        zoom: 14,
+        pitch: 50
+    });
+
+    // Kullanıcı haritayı kaydırmaya başladığında takibi durdur
+    map.on('movestart', (e) => {
+        if (e.originalEvent) { // Eğer hareket kullanıcı kaynaklıysa (dokunma/mouse)
+            isMapInteracting = true;
+        }
+    });
+
+    function recenterMap() {
+        isMapInteracting = false;
+        if (userLocation) map.easeTo({ center: userLocation, zoom: 16 });
+    }
+
+    // --- KONUM TAKİBİ VE GPS ---
+    navigator.geolocation.watchPosition(async pos => {
+        const newLoc = [pos.coords.longitude, pos.coords.latitude];
+        const speed = Math.round(pos.coords.speed * 3.6) || 0;
+        
+        // Rota Yenileme Mantığı: Eğer hedefe giderken 30 metre saparsak
+        if (isNavigating && userLocation) {
+            const moveDist = calculateDistance(userLocation, newLoc);
+            if (moveDist > 0.035) { // Yaklaşık 35 metre sapma
+                console.log("Rota yenileniyor...");
+                getRoute(currentDestination);
+            }
+        }
+        
+        userLocation = newLoc;
+
+        // Kullanıcı haritayla oynamıyorsa takip et
+        if (!isMapInteracting) {
+            map.setCenter(userLocation);
+        }
+
+        document.getElementById('stats').innerText = `Hız: ${speed} km/h`;
+    }, (err) => console.error(err), { enableHighAccuracy: true });
+
+    // --- BLUETOOTH İŞLEMLERİ ---
+    async function initBLE() {
+        try {
+            const device = await navigator.bluetooth.requestDevice({
+                filters: [{ services: [SERVICE_UUID] }]
+            });
+            const server = await device.gatt.connect();
+            const service = await server.getPrimaryService(SERVICE_UUID);
+            bleCharacteristic = await service.getCharacteristic(CHAR_UUID);
+            
+            document.getElementById('status').innerText = "Bluetooth: Bağlı ✅";
+            document.getElementById('status').style.color = "#00ff00";
+        } catch (e) {
+            alert("Bluetooth Bağlantı Hatası: " + e);
+        }
+    }
+
+    // --- NAVİGASYON MANTIĞI ---
+    map.on('click', (e) => {
+        isMapInteracting = false; // Hedef seçince takibe geri dön
+        currentDestination = e.lngLat;
+        getRoute(currentDestination);
+    });
+
+    async function getRoute(dest) {
+        if (!userLocation) return alert("Konum bekleniyor...");
+        
+        const url = `https://api.mapbox.com/directions/v5/mapbox/driving/${userLocation[0]},${userLocation[1]};${dest.lng},${dest.lat}?steps=true&geometries=geojson&access_token=${MAPBOX_TOKEN}&language=tr`;
+        
+        try {
+            const response = await fetch(url);
+            const data = await response.json();
+            const route = data.routes[0];
+
+            // Haritada rotayı göster
+            const geojson = { type: 'Feature', geometry: route.geometry };
+            if (map.getSource('route')) {
+                map.getSource('route').setData(geojson);
+            } else {
+                map.addLayer({ id: 'route', type: 'line', source: { type: 'geojson', data: geojson }, paint: { 'line-color': '#007bff', 'line-width': 6 } });
+            }
+
+            isNavigating = true;
+            processAndSend(route);
+        } catch (e) {
+            console.error("Rota hatası:", e);
+        }
+    }
+
+    function processAndSend(route) {
+        const step = route.legs[0].steps[0];
+        const nextStep = route.legs[0].steps[1];
+        
+        let instruction = step.maneuver.instruction.toLowerCase();
+        let targetStreet = nextStep ? (nextStep.name || "İsimsiz Yol") : "Hedef";
+        
+        // Türkçe karakter temizleme (ESP32 Uyumluluğu)
+        const trMap = {'ğ':'g','ü':'u','ş':'s','ı':'i','ö':'o','ç':'c','İ':'I','Ğ':'G','Ü':'U','Ş':'S','Ö':'O','Ç':'C'};
+        targetStreet = targetStreet.replace(/[ğüşıöçİĞÜŞÖÇ]/g, function(m){ return trMap[m]; });
+
+        let yon = "DUZ";
+        if (instruction.includes("sağ")) yon = "SAG";
+        else if (instruction.includes("sol")) yon = "SOL";
+
+        const dist = Math.round(step.distance) + "m";
+        const time = Math.round(route.duration / 60) + "dk";
+        const totalDist = (route.distance / 1000).toFixed(1) + "km";
+
+        // UI Güncelleme
+        document.getElementById('instruction').innerText = `${targetStreet} (${dist})`;
+        document.getElementById('stats').innerText = `Kalan: ${time} | Toplam: ${totalDist}`;
+
+        // ESP32 Paketi: "YON,MESAFE,SURE,TOPLAM,SOKAK"
+        const payload = `${yon},${dist},${time},${totalDist},${targetStreet.substring(0,16)}`;
+        
+        if (bleCharacteristic) {
+            const encoder = new TextEncoder();
+            bleCharacteristic.writeValue(encoder.encode(payload)).catch(e => console.log(e));
+        }
+    }
+
+    function calculateDistance(p1, p2) {
+        const R = 6371; // Dünya yarıçapı km
+        const dLat = (p2[1]-p1[1]) * Math.PI / 180;
+        const dLon = (p2[0]-p1[0]) * Math.PI / 180;
+        const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+                Math.cos(p1[1]*Math.PI/180) * Math.cos(p2[1]*Math.PI/180) * Math.sin(dLon/2) * Math.sin(dLon/2);
+        const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+        return R * c;
+    }
+</script>
+</body>
+</html>
